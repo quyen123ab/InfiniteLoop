@@ -1,3 +1,4 @@
+use crate::gm_control::{GmControl, GmRequest};
 use anyhow::{bail, Context, Result};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,11 @@ impl LauncherLog {
     }
 
     fn beside_executable() -> Result<Self> {
+        if crate::distribution::PAIRED {
+            let directory = root()?.join("logs");
+            fs::create_dir_all(&directory)?;
+            return Self::open(directory.join("launcher.log"));
+        }
         Self::open(
             env::current_exe()?
                 .parent()
@@ -189,6 +195,37 @@ pub struct LocalBuild {
     pub mongo_port: u16,
 }
 
+const PAIRED_RUNTIME_STATE: &str = "paired-runtime.json";
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PairedRuntime {
+    pub dotnet: PathBuf,
+    pub mongod: PathBuf,
+    pub sdk_port: u16,
+    pub game_port: u16,
+    pub mongo_port: u16,
+}
+
+impl PairedRuntime {
+    fn bind_release(self, release: &crate::distribution::Release) -> LocalBuild {
+        let server = release.directory.join("server");
+        LocalBuild {
+            schema_version: SCHEMA_VERSION,
+            revision: release.commit.clone(),
+            repository: crate::distribution::REPOSITORY.to_owned(),
+            dotnet: self.dotnet,
+            mongod: self.mongod,
+            server_directory: server.clone(),
+            resource_directory: server,
+            patch_directory: release.directory.join("patch"),
+            sdk_port: self.sdk_port,
+            game_port: self.game_port,
+            mongo_port: self.mongo_port,
+        }
+    }
+}
+
 pub fn root() -> Result<PathBuf> {
     let base = env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?;
     let base = PathBuf::from(base);
@@ -207,7 +244,7 @@ pub fn load_build() -> Result<Option<LocalBuild>> {
         Err(error) => return Err(error).with_context(|| format!("read {}", state.display())),
     };
     let build: LocalBuild = serde_json::from_slice(&bytes).context("invalid local build state")?;
-    validate_build(&root, &build)?;
+    validate_build(&root, &build, None)?;
     crate::package::refresh_supported_client(
         &build.patch_directory,
         &env::current_exe()?
@@ -216,6 +253,61 @@ pub fn load_build() -> Result<Option<LocalBuild>> {
             .join("supported-client.json"),
     )?;
     Ok(Some(build))
+}
+
+pub(crate) fn load_paired_build(release: &crate::distribution::Release) -> Result<Option<LocalBuild>> {
+    let root = root()?;
+    let path = root.join(PAIRED_RUNTIME_STATE);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let runtime: PairedRuntime = serde_json::from_slice(&bytes).context("invalid paired runtime state")?;
+    let build = runtime.bind_release(release);
+    validate_build(&root, &build, Some(release))?;
+    Ok(Some(build))
+}
+
+pub(crate) fn prepare_paired(release: &crate::distribution::Release, game: &Path, progress: &mut dyn FnMut(&str)) -> Result<LocalBuild> {
+    #[cfg(windows)]
+    {
+        let mut log = LauncherLog::beside_executable()?;
+        log.write(&format!("Paired Setup attempt started for {}", release.commit))?;
+        let result = (|| {
+            let _operation = operation_lock()?;
+            let root = root()?;
+            fs::create_dir_all(&root)?;
+            let _setup_lock = open_setup_lock(&root)?;
+            let package = crate::package::load_package(&release.directory.join("patch"))?;
+            let patch = crate::install::inspect(game, &package)?;
+            if let crate::install::PatchState::Unsupported(reason) | crate::install::PatchState::RepairRequired(reason) = patch {
+                bail!("Client patch cannot be prepared: {reason}");
+            }
+            let state = root.join(PAIRED_RUNTIME_STATE);
+            progress("Preparing the runtime for this paired release");
+            let runtime = crate::setup::prepare_paired_runtime(
+                &root, &release.directory.join("server/Configs/config.json"), &state, progress,
+                &mut |line| log.write(line), Instant::now() + SETUP_TIMEOUT,
+            )?;
+            let bytes = serde_json::to_vec_pretty(&runtime)?;
+            let build = runtime.bind_release(release);
+            validate_build(&root, &build, Some(release))?;
+            let pending = root.join("paired-runtime.pending.json");
+            crate::setup::write_atomic(&pending, &bytes)?;
+            crate::install::install_with_consent(game, &package, &mut |line| progress(&line))?;
+            anyhow::ensure!(crate::install::inspect(game, &package)? == crate::install::PatchState::Current,
+                "paired client patch did not become current");
+            atomic_replace(&pending, &state)?;
+            Ok(build)
+        })();
+        log.finish(result)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (release, game, progress);
+        bail!("paired Setup is supported on Windows only");
+    }
 }
 
 pub fn prepare(
@@ -272,7 +364,7 @@ fn prepare_logged(
     let bytes = fs::read(&pending).with_context(|| format!("read {}", pending.display()))?;
     let build: LocalBuild =
         serde_json::from_slice(&bytes).context("invalid pending local build state")?;
-    validate_build(&root, &build)?;
+    validate_build(&root, &build, None)?;
     crate::package::refresh_supported_client(
         &build.patch_directory,
         &launcher_dir.join("supported-client.json"),
@@ -550,6 +642,8 @@ mod update_tests {
 
 pub struct LocalRuntime {
     server: OwnedChild,
+    control: GmControl,
+    gm_version: Option<String>,
     mongo: OwnedChild,
     dotnet: PathBuf,
     server_dll: PathBuf,
@@ -562,9 +656,17 @@ pub struct LocalRuntime {
 
 impl LocalRuntime {
     pub fn start(build: &LocalBuild, progress: &mut dyn FnMut(&str)) -> Result<Self> {
+        Self::start_with_bundle(build, None, progress)
+    }
+
+    pub fn start_with_bundle(
+        build: &LocalBuild,
+        release: Option<&crate::distribution::Release>,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Self> {
         #[cfg(not(windows))]
         {
-            let _ = (build, progress);
+            let _ = (build, release, progress);
             bail!("the local runtime is supported on Windows only");
         }
         #[cfg(windows)]
@@ -574,8 +676,15 @@ impl LocalRuntime {
 
             let operation = operation_lock()?;
             let root = root()?;
-            validate_build(&root, build)?;
-            crate::setup::install_runtime_config(&root, &build.server_directory, build.game_port, build.mongo_port)?;
+            let _setup_lock = open_setup_lock(&root)?;
+            validate_build(&root, build, release)?;
+            let config_path = root.join("config.json");
+            if release.is_some() {
+                crate::setup::read_runtime_config(&config_path, build.game_port, build.mongo_port)?;
+            } else {
+                crate::setup::install_runtime_config(&root, &build.server_directory, build.game_port, build.mongo_port)?;
+            }
+            let server_dll = build.server_directory.join("AscNet.dll");
             let _ports = reserve_ports([build.mongo_port, build.sdk_port, build.game_port])?;
             fs::create_dir_all(root.join("data/mongo"))?;
             fs::create_dir_all(root.join("logs"))?;
@@ -605,37 +714,67 @@ impl LocalRuntime {
             progress("Starting AscNet server");
             let origin = format!("http://127.0.0.1:{}", build.sdk_port);
             let server_log = RotatingLog::open(root.join("logs/server.log"), BACKEND_LOG_LIMIT)?;
-            let mut server = OwnedChild(
-                Command::new(&build.dotnet)
-                    .arg(build.server_directory.join("AscNet.dll"))
+            let mut command = Command::new(&build.dotnet);
+            command
+                    .arg(&server_dll)
                     .args(["--urls", &origin])
                     .current_dir(&build.resource_directory)
                     .env("ASCNET_GATE_FALLBACK_USERNAME", "")
                     .env("ASCNET_PUBLIC_HTTP_ORIGIN", &origin)
                     .env("ASCNET_GAME_BIND_ADDRESS", "127.0.0.1")
                     .env("ASCNET_MANAGED_STDIN", "1")
+                    .env("ASCNET_MANAGED_GM", "1")
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .creation_flags(CREATE_NO_WINDOW.0)
-                    .spawn()
-                    .context("start AscNet server")?,
+                    .stderr(Stdio::piped());
+            if release.is_some() {
+                command.env("ASCNET_CONFIG_PATH", &config_path);
+            } else {
+                command.env_remove("ASCNET_CONFIG_PATH");
+            }
+            let mut server = OwnedChild(spawn_hidden(&mut command).context("start AscNet server")?);
+            let log = server_log.clone();
+            let control = GmControl::attach(
+                server.0.stdin.take().context("AscNet server stdin is unavailable")?,
+                server.0.stdout.take().context("AscNet server stdout is unavailable")?,
+                move |line| if let Ok(mut log) = log.lock() { let _ = log.write(line); },
             );
             pump_output(&mut server.0, &server_log);
             assign_to_job(&job, &server.0)?;
             wait_server(&mut server.0, &origin, build.game_port)?;
+            let hello_timeout = if release.is_some() { Duration::from_secs(5) } else { Duration::from_millis(1500) };
+            let gm_version = control
+                .request_with_timeout(GmRequest::Hello, hello_timeout)
+                .ok()
+                .and_then(|reply| reply.server_version);
+            let _ = launcher_log(&format!("Started AscNet host {} DLL {} GM protocol {}",
+                build.dotnet.display(), server_dll.display(), gm_version.as_deref().unwrap_or("unavailable")));
+            if let Some(release) = release {
+                let revision = format!("+{}", release.commit);
+                anyhow::ensure!(gm_version.as_deref().is_some_and(|version| version.ends_with(&revision)),
+                    "The bundled server is missing GM control or was built from a different commit");
+            }
             progress("Local backend is ready");
             Ok(Self {
                 server,
+                control,
+                gm_version,
                 mongo,
                 dotnet: build.dotnet.clone(),
-                server_dll: build.server_directory.join("AscNet.dll"),
+                server_dll,
                 mongo_port: build.mongo_port,
                 stopped: false,
                 job,
                 _operation: Some(operation),
             })
         }
+    }
+
+    pub fn gm_control(&self) -> Result<GmControl> {
+        if self.gm_version.is_none() {
+            bail!("This server build does not support GM Tools. Start the matching launcher and server bundle.");
+        }
+        Ok(self.control.clone())
     }
 
     pub fn stop(&mut self) -> Result<()> {
@@ -646,20 +785,7 @@ impl LocalRuntime {
             if self.stopped {
                 return Ok(());
             }
-            let server_request = (|| -> Result<()> {
-                let stdin = self
-                    .server
-                    .0
-                    .stdin
-                    .as_mut()
-                    .context("AscNet server stdin is unavailable")?;
-                stdin
-                    .write_all(b"shutdown\n")
-                    .context("request AscNet server shutdown")?;
-                stdin
-                    .flush()
-                    .context("flush AscNet server shutdown request")
-            })();
+            let server_request = self.control.shutdown();
             let server_result = wait_or_kill(&mut self.server.0, STOP_TIMEOUT);
 
             let helper_result = (|| -> Result<bool> {
@@ -982,7 +1108,7 @@ fn validate_branch(branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_build(root: &Path, build: &LocalBuild) -> Result<()> {
+fn validate_build(root: &Path, build: &LocalBuild, release: Option<&crate::distribution::Release>) -> Result<()> {
     if build.schema_version != SCHEMA_VERSION {
         bail!("unsupported local build schema {}", build.schema_version);
     }
@@ -999,9 +1125,17 @@ fn validate_build(root: &Path, build: &LocalBuild) -> Result<()> {
     {
         bail!("local build ports must be distinct non-zero ports");
     }
-    let canonical_root = root
+    let install_root = release.map_or(root, |release| release.directory.as_path());
+    let canonical_root = install_root
         .canonicalize()
-        .with_context(|| format!("resolve {}", root.display()))?;
+        .with_context(|| format!("resolve {}", install_root.display()))?;
+    if let Some(release) = release {
+        anyhow::ensure!(build.revision == release.commit && build.repository == crate::distribution::REPOSITORY,
+            "paired build source does not match the running release");
+        anyhow::ensure!(build.server_directory == release.directory.join("server") &&
+            build.resource_directory == build.server_directory && build.patch_directory == release.directory.join("patch"),
+            "paired server and patch paths must come from the running release");
+    }
     for (name, path) in [
         ("serverDirectory", &build.server_directory),
         ("resourceDirectory", &build.resource_directory),

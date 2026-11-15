@@ -13,7 +13,8 @@ namespace AscNet.Common
 
         static Common()
         {
-            config = new ConfigurationBuilder<IConfig>().UseJsonFile("Configs/config.json").Build();
+            string configPath = Environment.GetEnvironmentVariable("ASCNET_CONFIG_PATH") ?? "Configs/config.json";
+            config = new ConfigurationBuilder<IConfig>().UseJsonFile(configPath).Build();
 
             // One rule for every persisted AscNet class (Player, MissionProgressState, Character, ...): a renamed/removed field in an old save
             // must not fail deserialization. Registered before any class map is built (first Common.db use).

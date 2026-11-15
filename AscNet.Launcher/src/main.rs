@@ -7,20 +7,12 @@ mod steam;
 mod ui;
 
 use anyhow::{Context, Result};
-use ascnet_launcher::{install, local, package};
-use serde::Deserialize;
+use ascnet_launcher::{distribution, install, local, package};
 use serde_json::json;
 use std::{
-    env, fs,
+    env,
     path::{Path, PathBuf},
 };
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DistributorConfig {
-    repository_url: String,
-    branch: String,
-}
 
 fn main() {
     #[cfg(windows)]
@@ -41,12 +33,26 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    if ascnet_launcher::updater::startup()? {
+    if let Some(launcher) = distribution::active_launcher(&executable_dir()?)? {
+        let arguments: Vec<_> = env::args_os().skip(1).collect();
+        let mut command = std::process::Command::new(&launcher);
+        command.current_dir(launcher.parent().context("active launcher has no parent directory")?);
+        if arguments.is_empty() {
+            command.spawn().context("start the active PGR 4.9 launcher")?;
+        } else {
+            let status = command.args(arguments).status().context("run the active PGR 4.9 launcher")?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
         return Ok(());
     }
-    local::launcher_log("Launcher started")?;
+    if !distribution::PAIRED && ascnet_launcher::updater::startup()? {
+        return Ok(());
+    }
     let args: Vec<String> = env::args().skip(1)
         .filter(|arg| arg != "--self-update-health" && arg != "--self-update-rolled-back").collect();
+    if args.as_slice() != ["--verify-release"] {
+        local::launcher_log("Launcher started")?;
+    }
     if args.is_empty() {
         #[cfg(windows)]
         {
@@ -61,10 +67,11 @@ fn run() -> Result<()> {
             let game = PathBuf::from(&args[1]);
             if !steam::valid_game_directory(&game) { anyhow::bail!("game directory does not contain PGR.exe") }
             if install::game_running()? { anyhow::bail!("close PGR.exe before setup") }
-            let config: DistributorConfig = serde_json::from_slice(
-                &fs::read(executable_dir()?.join("launcher.json")).context("launcher.json is missing")?,
-            ).context("launcher.json is invalid")?;
-            let build = local::prepare(&config.repository_url, &config.branch, &game, &mut |line| eprintln!("{line}"))?;
+            #[cfg(windows)]
+            let build = ui::setup_from_cli(&game, &mut |line| eprintln!("{line}"))?;
+            #[cfg(not(windows))]
+            let build = distribution::Distribution::load(&executable_dir()?)?
+                .prepare(&game, &mut |line| eprintln!("{line}"))?;
             println!("{}", build.revision);
         }
         "--inspect" => {
@@ -91,13 +98,19 @@ fn run() -> Result<()> {
             let value: serde_json::Value = response.json()?;
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
-        _ => anyhow::bail!("usage: ascnet-launcher [--setup GAME | --inspect GAME | --install GAME | --restore GAME | --check-server ORIGIN]"),
+        "--verify-release" => {
+            require_len(&args, 1, "--verify-release")?;
+            let distribution = distribution::Distribution::load(&executable_dir()?)?;
+            anyhow::ensure!(distribution.release.is_some(), "This is not a paired launcher release");
+        }
+        _ => anyhow::bail!("usage: ascnet-launcher [--setup GAME | --inspect GAME | --install GAME | --restore GAME | --check-server ORIGIN | --verify-release]"),
     }
     Ok(())
 }
 
 fn built_package() -> Result<package::PatchPackage> {
-    let build = local::load_build()?.context("no local build; run --setup first")?;
+    let distribution = distribution::Distribution::load(&executable_dir()?)?;
+    let build = distribution.load_build()?.context("no local build; run --setup first")?;
     package::load_package(&build.patch_directory)
 }
 

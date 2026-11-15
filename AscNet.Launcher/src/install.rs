@@ -236,7 +236,7 @@ fn inspect_prepared(client: &Path, package: &PatchPackage) -> Result<PatchState>
             return Ok(PatchState::RepairRequired(error.to_string()));
         }
         match compare_versions(&package.manifest.version, &state.release_version) {
-            Ok(std::cmp::Ordering::Less) => {
+            Ok(std::cmp::Ordering::Less) if !crate::distribution::owns_patch(&package.directory) => {
                 return Ok(PatchState::Unsupported("release downgrade refused".into()))
             }
             Err(error) => return Ok(PatchState::RepairRequired(error.to_string())),
@@ -686,6 +686,7 @@ pub fn install(
         if old.release_version != "legacy"
             && compare_versions(&package.manifest.version, &old.release_version)?
                 == std::cmp::Ordering::Less
+            && !crate::distribution::owns_patch(&package.directory)
         {
             bail!("release downgrade refused");
         }

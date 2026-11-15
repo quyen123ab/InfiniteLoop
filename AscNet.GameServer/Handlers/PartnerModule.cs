@@ -542,22 +542,30 @@ namespace AscNet.GameServer.Handlers
                 return;
             }
 
+            // The client's quick upgrade uses XPartnerManager.GetExpItemList to select feed items.
+            string? expItemList = TableReaderV2.Parse<ConfigTable>()
+                .Find(row => row.Key == PartnerExpItemListKey)?.Value;
+            HashSet<int> expItemIds = ReadPartnerExpItemIds(expItemList).ToHashSet();
+            Dictionary<int, ItemTable> expItems = TableReaderV2.Parse<ItemTable>()
+                .Where(row => expItemIds.Contains(row.Id) && row.ItemType == (int)Common.ItemType.PartnerExp
+                    && row.SubTypeParams is [> 0, >= 0, ..])
+                .ToDictionary(row => row.Id);
             Dictionary<int, int> requestedItems = request.UseItems ?? [];
-            List<(int ItemId, int Count, int Exp, int CoinCost)> materials = requestedItems
-                .Where(item => item.Value > 0)
-                .Select(item =>
+            long expGain = 0;
+            long coinCost = 0;
+            foreach ((int itemId, int count) in requestedItems)
+            {
+                if (count <= 0 || !expItems.TryGetValue(itemId, out ItemTable? item)
+                    || ItemCount(session, itemId) < count)
                 {
-                    ItemTable? config = TableReaderV2.Parse<ItemTable>().Find(row => row.Id == item.Key);
-                    int exp = config?.SubTypeParams.FirstOrDefault() ?? 0;
-                    int coinCost = config?.SubTypeParams.Skip(1).FirstOrDefault() ?? 0;
-                    return (ItemId: item.Key, Count: item.Value, Exp: exp, CoinCost: coinCost);
-                })
-                .Where(item => item.ItemId is 30111 or 30113 && item.Exp > 0)
-                .ToList();
-            int totalCoinCost = materials.Sum(item => checked(item.CoinCost * item.Count));
-            if (materials.Count == 0 || materials.Count != requestedItems.Count
-                || ItemCount(session, Inventory.Coin) < totalCoinCost
-                || materials.Any(item => ItemCount(session, item.ItemId) < item.Count))
+                    session.SendResponse(new PartnerLevelUpResponse { Code = ErrorCode }, packet.Id);
+                    return;
+                }
+
+                expGain += (long)item.SubTypeParams[0] * count;
+                coinCost += (long)item.SubTypeParams[1] * count;
+            }
+            if (requestedItems.Count == 0 || coinCost > int.MaxValue || ItemCount(session, Inventory.Coin) < coinCost)
             {
                 session.SendResponse(new PartnerLevelUpResponse { Code = ErrorCode }, packet.Id);
                 return;
@@ -565,18 +573,17 @@ namespace AscNet.GameServer.Handlers
 
             List<(int Level, int AllExp)> levels = GetLevelTemplate(breakthrough.LevelUpTemplateId);
             int currentAllExp = levels.First(row => row.Level == partner.Level).AllExp;
-            int totalExp = checked(currentAllExp + partner.Exp
-                + materials.Sum(item => checked(item.Exp * item.Count)));
-            int newLevel = levels.Where(row => row.AllExp <= totalExp).Select(row => row.Level).DefaultIfEmpty(1).Max();
-            newLevel = Math.Min(newLevel, breakthrough.LevelLimit);
+            long totalExp = currentAllExp + (long)partner.Exp + expGain;
+            int newLevel = levels.Where(row => row.Level <= breakthrough.LevelLimit && row.AllExp <= totalExp)
+                .Select(row => row.Level).DefaultIfEmpty(1).Max();
             int expAtLevel = levels.First(row => row.Level == newLevel).AllExp;
             partner.Level = newLevel;
-            partner.Exp = newLevel == breakthrough.LevelLimit ? 0 : totalExp - expAtLevel;
+            partner.Exp = newLevel == breakthrough.LevelLimit ? 0 : (int)(totalExp - expAtLevel);
 
             NotifyItemDataList notifyItems = new();
-            if (totalCoinCost > 0)
-                notifyItems.ItemDataList.Add(session.inventory.Do(Inventory.Coin, -totalCoinCost));
-            foreach ((int itemId, int count, _, _) in materials)
+            if (coinCost > 0)
+                notifyItems.ItemDataList.Add(session.inventory.Do(Inventory.Coin, -(int)coinCost));
+            foreach ((int itemId, int count) in requestedItems)
                 notifyItems.ItemDataList.Add(session.inventory.Do(itemId, -count));
             session.SendPush(notifyItems);
             session.inventory.Save();
@@ -1021,13 +1028,21 @@ namespace AscNet.GameServer.Handlers
             504 => TableReaderV2.Parse<PartnerLevelUpTemplate504Table>().Select(row => (row.Level, row.AllExp)).ToList(),
             _ => []
         };
+
+        private const string PartnerExpItemListKey = "PartnerDecomposeExpItemRebate";
+
+        private static IEnumerable<int> ReadPartnerExpItemIds(string? itemList) => (itemList ?? string.Empty)
+            .Split('|', StringSplitOptions.RemoveEmptyEntries)
+            .Select(value => int.TryParse(value, out int id) ? id : 0)
+            .Where(id => id > 0);
+
         // EN XPartnerManager.GetPartnerDecomposeRewards; all inputs remain table- or state-derived.
         private static bool TryGetPartnerDecomposeRewards(
             IReadOnlyList<PartnerData> partners,
             out List<RewardGoods> rewards)
         {
             Dictionary<string, string> config = TableReaderV2.Parse<ConfigTable>()
-                .Where(row => row.Key is "PartnerDecomposeExpItemRebate"
+                .Where(row => row.Key is PartnerExpItemListKey
                     or "PartnerDecomposeLevelBreakRebate"
                     or "PartnerDecomposeEvolutionRebate"
                     or "PartnerDecomposeSkillRebate")
@@ -1047,11 +1062,8 @@ namespace AscNet.GameServer.Handlers
             }
 
             Dictionary<int, ItemTable> items = TableReaderV2.Parse<ItemTable>().ToDictionary(row => row.Id);
-            List<(int Id, int Exp, int Coin)> expItems = (config.GetValueOrDefault(
-                    "PartnerDecomposeExpItemRebate") ?? string.Empty)
-                .Split('|', StringSplitOptions.RemoveEmptyEntries)
-                .Select(value => int.TryParse(value, out int id) ? id : 0)
-                .Where(id => id > 0 && items.ContainsKey(id))
+            List<(int Id, int Exp, int Coin)> expItems = ReadPartnerExpItemIds(config.GetValueOrDefault(PartnerExpItemListKey))
+                .Where(items.ContainsKey)
                 .Select(id => (Id: id, Exp: items[id].SubTypeParams.FirstOrDefault(),
                     Coin: items[id].SubTypeParams.Skip(1).FirstOrDefault()))
                 .Where(item => item.Exp > 0)

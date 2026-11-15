@@ -53634,6 +53634,60 @@
         "BuyPriority": 0,
         "ActivityConsumeCount": 0,
         "ActivityDiscount": 0
+      },
+      {
+        "Id": 147066,
+        "Priority": 9990,
+        "RewardGoods": { "RewardType": 1, "TemplateId": 40104, "Count": 4 },
+        "ConsumeList": [{ "Id": 62738, "Count": 35 }],
+        "BuyTimesLimit": 0,
+        "OnSales": {},
+        "ConditionIds": []
+      },
+      {
+        "Id": 147067,
+        "Priority": 9989,
+        "RewardGoods": { "RewardType": 1, "TemplateId": 40103, "Count": 4 },
+        "ConsumeList": [{ "Id": 62738, "Count": 45 }],
+        "BuyTimesLimit": 0,
+        "OnSales": {},
+        "ConditionIds": []
+      },
+      {
+        "Id": 147068,
+        "Priority": 9988,
+        "RewardGoods": { "RewardType": 1, "TemplateId": 40100, "Count": 4 },
+        "ConsumeList": [{ "Id": 62738, "Count": 30 }],
+        "BuyTimesLimit": 0,
+        "OnSales": {},
+        "ConditionIds": []
+      },
+      {
+        "Id": 147069,
+        "Priority": 9987,
+        "RewardGoods": { "RewardType": 1, "TemplateId": 40114, "Count": 4 },
+        "ConsumeList": [{ "Id": 62738, "Count": 70 }],
+        "BuyTimesLimit": 0,
+        "OnSales": {},
+        "ConditionIds": []
+      },
+      {
+        "Id": 147070,
+        "Priority": 9986,
+        "RewardGoods": { "RewardType": 1, "TemplateId": 40113, "Count": 4 },
+        "ConsumeList": [{ "Id": 62738, "Count": 90 }],
+        "BuyTimesLimit": 0,
+        "OnSales": {},
+        "ConditionIds": []
+      },
+      {
+        "Id": 147071,
+        "Priority": 9985,
+        "RewardGoods": { "RewardType": 1, "TemplateId": 40110, "Count": 4 },
+        "ConsumeList": [{ "Id": 62738, "Count": 60 }],
+        "BuyTimesLimit": 0,
+        "OnSales": {},
+        "ConditionIds": []
       }
     ],
     "ScreenGroupList": [],

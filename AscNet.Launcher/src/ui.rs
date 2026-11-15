@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use ascnet_launcher::{
+    distribution::Distribution,
     download,
     fps,
     graphics_ini,
@@ -37,8 +38,10 @@ use windows::{
 };
 
 mod client;
+mod gm;
 
 const WM_EVENT: u32 = WM_APP + 1;
+const WM_GM_UID: u32 = WM_APP + 2;
 const ID_BROWSE: i32 = 101;
 const ID_CHECK: i32 = 102;
 const ID_ACTION: i32 = 103;
@@ -65,6 +68,7 @@ const ID_MUSIC_MUTED: i32 = 130;
 const ID_LAUNCHER_HEADING: i32 = 132;
 const ID_MUSIC_LABEL: i32 = 134;
 const ID_STATUS_LINE: i32 = 136;
+const ID_GM_TOOLS: i32 = 138;
 /// Settings action. The home button becomes PLAY after setup succeeds, so this
 /// is the way to run that same setup again.
 const ID_RERUN_SETUP: i32 = 139;
@@ -94,13 +98,6 @@ fn mod_toggle_row(id: i32) -> Option<usize> {
 const CENTERED_EDIT_HEIGHT: i32 = 22;
 const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DistributorConfig {
-    repository_url: String,
-    branch: String,
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Settings {
@@ -123,6 +120,8 @@ struct Settings {
     client_mods_enabled: bool,
     #[serde(default)]
     enabled_mods: BTreeMap<String, bool>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -135,6 +134,7 @@ impl Default for Settings {
             region: None,
             client_mods_enabled: false,
             enabled_mods: BTreeMap::new(),
+            extra: BTreeMap::new(),
         }
     }
 }
@@ -187,7 +187,7 @@ struct SupportedClient {
 }
 
 struct Model {
-    config: DistributorConfig,
+    config: Distribution,
     settings: Settings,
     build: Option<LocalBuild>,
     package: Option<PatchPackage>,
@@ -232,6 +232,8 @@ struct Window {
     label_font: HFONT,
     progress_phase: i32,
     settings_open: bool,
+    gm_window: HWND,
+    gm_uid: i64,
     log: VecDeque<String>,
     client: client::State,
     mods: Vec<mods::ModInfo>,
@@ -299,11 +301,8 @@ unsafe fn run_inner() -> Result<()> {
         .parent()
         .context("launcher executable has no parent")?
         .to_path_buf();
-    let config: DistributorConfig = serde_json::from_slice(
-        &fs::read(exe_dir.join("launcher.json")).context("launcher.json is missing")?,
-    )
-    .context("launcher.json is invalid")?;
-    let mut settings = load_settings().unwrap_or_default();
+    let config = Distribution::load(&exe_dir)?;
+    let mut settings = load_settings()?;
     if settings
         .selected_game
         .as_deref()
@@ -445,6 +444,8 @@ unsafe fn run_inner() -> Result<()> {
         progress_phase: 0,
         label_font,
         settings_open: false,
+        gm_window: HWND(0),
+        gm_uid: 2,
         log,
         client: client::State::new(region),
         mods: Vec::new(),
@@ -485,9 +486,11 @@ unsafe fn run_inner() -> Result<()> {
     );
     let _ = ShowWindow(hwnd, SW_SHOW);
     let _ = SetForegroundWindow(hwnd);
-    if let Err(error) = updater::acknowledge_startup() {
-        let _ = DestroyWindow(hwnd);
-        return Err(error);
+    if !ascnet_launcher::distribution::PAIRED {
+        if let Err(error) = updater::acknowledge_startup() {
+            let _ = DestroyWindow(hwnd);
+            return Err(error);
+        }
     }
     start_launcher_check(hwnd);
     let mut msg = MSG::default();
@@ -499,7 +502,10 @@ unsafe fn run_inner() -> Result<()> {
         if result == 0 {
             break;
         }
-        if !IsDialogMessageW(hwnd, &msg).as_bool() {
+        let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Window;
+        let gm_window = if state.is_null() { HWND(0) } else { (*state).gm_window };
+        let gm_handled = IsWindow(gm_window).as_bool() && IsDialogMessageW(gm_window, &msg).as_bool();
+        if !gm_handled && !IsDialogMessageW(hwnd, &msg).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -679,6 +685,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     (wp.0 & 0xffff) as i32,
                     ((wp.0 >> 16) & 0xffff) as u16,
                 );
+            }
+            LRESULT(0)
+        }
+        WM_GM_UID => {
+            if !ptr.is_null() {
+                let uid = ((lp.0 as u32 as u64) << 32) | (wp.0 as u32 as u64);
+                (*ptr).gm_uid = uid as i64;
             }
             LRESULT(0)
         }
@@ -1181,6 +1194,7 @@ unsafe fn create_controls(hwnd: HWND, state: &Window) {
     );
     for (id, text) in [
         (ID_SETTINGS, w!("SETTINGS")),
+        (ID_GM_TOOLS, w!("GM TOOLS")),
         (ID_MINIMIZE, w!("Minimize")),
         (ID_CLOSE, w!("Close")),
         (ID_HOME_ACTION, w!("SELECT GAME")),
@@ -1226,6 +1240,7 @@ unsafe fn create_controls(hwnd: HWND, state: &Window) {
         (ID_RERUN_SETUP, state.body_font),
         (ID_PLAY, state.heading_font),
         (ID_SETTINGS, state.label_font),
+        (ID_GM_TOOLS, state.label_font),
         (ID_MINIMIZE, state.heading_font),
         (ID_CLOSE, state.heading_font),
         (ID_HOME_ACTION, state.heading_font),
@@ -1257,6 +1272,7 @@ unsafe fn create_controls(hwnd: HWND, state: &Window) {
         ID_RERUN_SETUP,
         ID_PLAY,
         ID_SETTINGS,
+        ID_GM_TOOLS,
         ID_MINIMIZE,
         ID_CLOSE,
         ID_HOME_ACTION,
@@ -1363,6 +1379,7 @@ unsafe fn layout(hwnd: HWND, width: i32, height: i32, settings: bool, client: bo
             let _ = ShowWindow(GetDlgItem(hwnd, id), SW_HIDE);
         }
     }
+    let _ = ShowWindow(GetDlgItem(hwnd, ID_GM_TOOLS), if settings || client { SW_HIDE } else { SW_SHOW });
     if client {
         client::layout(hwnd, width, height);
         return;
@@ -1373,6 +1390,7 @@ unsafe fn layout(hwnd: HWND, width: i32, height: i32, settings: bool, client: bo
     let _ = MoveWindow(GetDlgItem(hwnd, ID_SUBTITLE), 112, 15, 240, 24, true);
     let _ = MoveWindow(GetDlgItem(hwnd, ID_CHECK), width - 270, 9, 100, 34, true);
     let _ = MoveWindow(GetDlgItem(hwnd, ID_SETTINGS), width - 158, 9, 46, 34, true);
+    let _ = MoveWindow(GetDlgItem(hwnd, ID_GM_TOOLS), width - 272, 9, 104, 34, true);
     let _ = MoveWindow(GetDlgItem(hwnd, ID_MINIMIZE), width - 106, 9, 46, 34, true);
     let _ = MoveWindow(GetDlgItem(hwnd, ID_CLOSE), width - 54, 9, 46, 34, true);
     for id in [ID_STATUS, ID_DETAIL, ID_STATUS_LINE] {
@@ -1638,6 +1656,10 @@ fn stop_services_after_game(hwnd: HWND, state: &mut Window) {
 
 unsafe fn finish_services_stopped(hwnd: HWND, state: &mut Window, result: Result<()>) {
     state.model.lock().unwrap().stopping = false;
+    if IsWindow(state.gm_window).as_bool() {
+        let _ = DestroyWindow(state.gm_window);
+    }
+    state.gm_window = HWND(0);
     let close_when_stopped = state.close_when_stopped;
     state.close_when_stopped = false;
     let message = match result {
@@ -1657,27 +1679,47 @@ unsafe fn finish_services_stopped(hwnd: HWND, state: &mut Window, result: Result
     }
 }
 
-fn apply_mod_settings(settings: &Settings) -> Result<String> {
+fn apply_mod_settings(settings: &Settings, distribution: &Distribution) -> Result<String> {
     let game = settings.selected_game.as_deref().context("Select a game folder before changing client mods")?;
     let root = local::root()?;
     let config = root.join("config.json");
     let persistent = mods::persistent_directory(game)?;
     if settings.client_mods_enabled {
-        mods::set_debug(&config, true)?;
         let selected: Vec<String> = settings.enabled_mods.iter()
             .filter(|(_, enabled)| **enabled).map(|(id, _)| id.clone()).collect();
-        let report = mods::apply(game, &persistent, &ascnet_launcher::setup::mods_directory(&root), &config, &selected)?;
+        let required = if distribution.release.is_some() && selected.iter().any(|id| id == "gm-menu") {
+            Some("gm-menu")
+        } else {
+            None
+        };
+        let report = mods::apply_from(game, &persistent, &distribution.mod_roots(&root), &config, &selected, required)?;
         Ok(format!("Applied: {}. Skipped: {}. Restart server and game.",
             report.applied.join(", "), report.skipped.join(", ")))
     } else {
+        if distribution.release.is_some() && !mods::has_installed_overrides(&persistent)? {
+            return Ok("Client mods disabled".to_owned());
+        }
         mods::set_debug(&config, false)?;
         mods::clean(game, &persistent)?;
         Ok("Client mods disabled; owned overrides removed. Restart server and game.".to_owned())
     }
 }
 
+pub(crate) fn setup_from_cli(game: &Path, progress: &mut dyn FnMut(&str)) -> Result<LocalBuild> {
+    let exe = env::current_exe()?;
+    let config = Distribution::load(exe.parent().context("launcher executable has no parent")?)?;
+    let build = config.prepare(game, progress)?;
+    if config.release.is_some() {
+        let mut settings = load_settings()?;
+        settings.selected_game = Some(game.to_path_buf());
+        progress(&apply_mod_settings(&settings, &config)?);
+    }
+    Ok(build)
+}
+
 unsafe fn refresh_mods(hwnd: HWND, state: &mut Window) {
-    match local::root().and_then(|root| mods::discover(&ascnet_launcher::setup::mods_directory(&root))) {
+    let distribution = state.model.lock().unwrap().config.clone();
+    match local::root().and_then(|root| mods::discover_from(&distribution.mod_roots(&root))) {
         Ok(catalog) => {
             state.mods = catalog;
         }
@@ -1715,7 +1757,7 @@ unsafe fn update_mod_controls(hwnd: HWND, state: &Window) {
     let status = if !state.mod_status.is_empty() {
         state.mod_status.clone()
     } else if state.mods.is_empty() {
-        "No mods available; run Setup to refresh the AscNet source.".to_owned()
+        "No mods available.".to_owned()
     } else if state.mods.len() > MOD_ROWS as usize {
         format!("Showing {MOD_ROWS} of {} mods. Restart server and game after changes.", state.mods.len())
     } else {
@@ -1736,9 +1778,9 @@ unsafe fn change_mods(hwnd: HWND, state: &mut Window, id: i32) {
             settings.enabled_mods.insert(item.id.clone(), checked);
         }
         model.busy = true;
-        Ok((settings, model.generation.fetch_add(1, Ordering::SeqCst) + 1, model.events.clone()))
+        Ok((settings, model.config.clone(), model.generation.fetch_add(1, Ordering::SeqCst) + 1, model.events.clone()))
     })();
-    let (settings, generation, events) = match prepared {
+    let (settings, distribution, generation, events) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             state.mod_status = format!("Client mods change failed: {error:#}");
@@ -1751,7 +1793,7 @@ unsafe fn change_mods(hwnd: HWND, state: &mut Window, id: i32) {
     update_mod_controls(hwnd, state);
     thread::spawn(move || {
         let status = (|| {
-            let status = apply_mod_settings(&settings)?;
+            let status = apply_mod_settings(&settings, &distribution)?;
             save_settings(&settings)?;
             Ok(status)
         })();
@@ -1767,6 +1809,23 @@ unsafe fn command(hwnd: HWND, state: &mut Window, id: i32, notification: u16) {
         return;
     }
     match id {
+        ID_GM_TOOLS => {
+            if IsWindow(state.gm_window).as_bool() {
+                let _ = SetForegroundWindow(state.gm_window);
+                return;
+            }
+            let control = {
+                let model = state.model.lock().unwrap();
+                model.runtime.as_ref().context("Start the local game before opening GM Tools.")
+                    .and_then(LocalRuntime::gm_control)
+            };
+            let game = state.model.lock().unwrap().settings.selected_game.clone();
+            match control.and_then(|control| gm::open(hwnd, control, state.gm_uid, game)) {
+                Ok(panel) => state.gm_window = panel,
+                Err(error) => show_fatal(&format!("{error:#}")),
+            }
+            return;
+        }
         ID_SETTINGS => {
             if state.client.open {
                 client::close(hwnd, state);
@@ -1949,6 +2008,11 @@ unsafe fn commit_inputs(hwnd: HWND, state: &mut Window) -> bool {
 }
 
 fn start_launcher_check(hwnd: HWND) {
+    if ascnet_launcher::distribution::PAIRED {
+        let _ = local::launcher_log("Paired distribution uses verified release deployment for updates");
+        start_refresh(hwnd, false, false);
+        return;
+    }
     if let Some(reason) = updater::updates_suppressed() {
         let _ = local::launcher_log(&format!("Automatic updates skipped: {reason}"));
         start_refresh(hwnd, true, false);
@@ -1966,7 +2030,7 @@ fn start_launcher_check(hwnd: HWND) {
         (
             m.generation.fetch_add(1, Ordering::SeqCst) + 1,
             m.events.clone(),
-            m.config.repository_url.clone(),
+            m.config.repository().to_owned(),
         )
     };
     unsafe { set_busy(hwnd, true, "Checking launcher releases…") };
@@ -2009,7 +2073,7 @@ fn start_refresh(hwnd: HWND, check_remote: bool, automatic: bool) {
     unsafe { set_busy(hwnd, true, "Inspecting local build and patch…") };
     thread::spawn(move || {
         let result = (|| {
-            let build = local::load_build()?;
+            let build = config.load_build()?;
             let package = build
                 .as_ref()
                 .map(|b| package::load_package(&b.patch_directory))
@@ -2026,7 +2090,7 @@ fn start_refresh(hwnd: HWND, check_remote: bool, automatic: bool) {
                 _ => Ok(None),
             };
             let update = if check_remote {
-                local::check_update(&config.repository_url, &config.branch, build.as_ref())
+                config.check_source_update(build.as_ref())
             } else {
                 Ok(None)
             };
@@ -2079,16 +2143,17 @@ fn start_prepare(hwnd: HWND, state: &mut Window) {
         set_busy(
             hwnd,
             true,
-            "Updating source and building local server and patch…",
+            if config.release.is_some() { "Preparing the paired release and client patch…" }
+            else { "Updating source and building local server and patch…" },
         )
     };
     thread::spawn(move || {
         let result = (|| {
             let mut progress = |s: &str| post_progress(hwnd, &events, s);
             install::log_action("Setup", &game, None, None);
-            let build = local::prepare(&config.repository_url, &config.branch, &game, &mut progress)?;
+            let build = config.prepare(&game, &mut progress)?;
             let settings = model.lock().map_err(|_| anyhow::anyhow!("Launcher state unavailable"))?.settings.clone();
-            post_progress(hwnd, &events, &apply_mod_settings(&settings)?);
+            post_progress(hwnd, &events, &apply_mod_settings(&settings, &config)?);
             let package = package::load_package(&build.patch_directory)?;
             let patch = install::inspect(&game, &package);
             install::log_action("Setup", &game, Some(&package), patch.as_ref().ok());
@@ -2165,11 +2230,12 @@ fn start_play(hwnd: HWND, state: &mut Window) {
                     m.settings.selected_game.clone().unwrap(),
                     m.build.clone().unwrap(),
                     m.package.clone().unwrap(),
+                    m.config.clone(),
                 ))
             }
         }
     };
-    let (generation, events, game, build, package) = match prepared {
+    let (generation, events, game, build, package, distribution) = match prepared {
         Ok(values) => values,
         Err(e) => {
             show_fatal(&e.to_string());
@@ -2180,7 +2246,7 @@ fn start_play(hwnd: HWND, state: &mut Window) {
     thread::spawn(move || {
         let result = (|| {
             let settings = model.lock().map_err(|_| anyhow::anyhow!("Launcher state unavailable"))?.settings.clone();
-            post_progress(hwnd, &events, &apply_mod_settings(&settings)?);
+            post_progress(hwnd, &events, &apply_mod_settings(&settings, &distribution)?);
             let patch = install::inspect(&game, &package);
             install::log_action("Play", &game, Some(&package), patch.as_ref().ok());
             let patch = patch?;
@@ -2189,7 +2255,7 @@ fn start_play(hwnd: HWND, state: &mut Window) {
             }
             install::install_with_consent(&game, &package, &mut |s| post_progress(hwnd, &events, &s))?;
             let mut runtime =
-                LocalRuntime::start(&build, &mut |s| post_progress(hwnd, &events, s))?;
+                LocalRuntime::start_with_bundle(&build, distribution.release.as_ref(), &mut |s| post_progress(hwnd, &events, s))?;
             let origin = local_origin(&build)?;
             let server = match fetch_status(&origin).and_then(|s| {
                 can_play_exact(&package, &patch, &s)?;
@@ -2406,6 +2472,7 @@ unsafe fn update_view(hwnd: HWND, model: &Arc<Mutex<Model>>) {
     set_enabled(hwnd, ID_RERUN_SETUP, !busy && !services);
     set_enabled(hwnd, ID_RESTORE, !busy && !stopping && can_restore);
     set_enabled(hwnd, ID_PLAY, !busy && can_launch);
+    set_enabled(hwnd, ID_GM_TOOLS, runtime && !stopping);
     let home_text = if busy {
         "WORKING…"
     } else if stopping {
@@ -2567,9 +2634,12 @@ fn settings_dir() -> Result<PathBuf> {
     )
 }
 fn load_settings() -> Result<Settings> {
-    Ok(serde_json::from_slice(&fs::read(
-        settings_dir()?.join("settings.json"),
-    )?)?)
+    let path = settings_dir()?.join("settings.json");
+    match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("Invalid launcher settings at {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+        Err(error) => Err(error).with_context(|| format!("Read {}", path.display())),
+    }
 }
 fn save_settings(s: &Settings) -> Result<()> {
     let dir = settings_dir()?;
@@ -3004,7 +3074,7 @@ unsafe fn draw_item(item: &DRAWITEMSTRUCT, state: &Window) {
     let hot = item.itemState.0 & ODS_HOTLIGHT.0 != 0
         || GetWindowLongPtrW(item.hwndItem, GWLP_USERDATA) != 0;
     let primary = item.CtlID as i32 == ID_HOME_ACTION || state.client.is_primary(item.CtlID as i32);
-    let header_control = matches!(item.CtlID as i32, ID_SETTINGS | ID_MINIMIZE | ID_CLOSE)
+    let header_control = matches!(item.CtlID as i32, ID_SETTINGS | ID_GM_TOOLS | ID_MINIMIZE | ID_CLOSE)
         || (item.CtlID as i32 == ID_CHECK && !state.settings_open);
     let brush = if disabled {
         state.muted_brush
@@ -3125,11 +3195,13 @@ mod settings_tests {
         assert!(!settings.client_mods_enabled);
         assert!(settings.enabled_mods.is_empty());
         settings.client_mods_enabled = true;
-        settings.enabled_mods.insert("console".to_owned(), true);
+        settings.enabled_mods.insert("gm-menu".to_owned(), true);
         settings.enabled_mods.insert("disabled".to_owned(), false);
+        settings.extra.insert("customSetting".into(), serde_json::json!({"keep": 1}));
         let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&settings)?)?;
         assert!(restored.client_mods_enabled);
         assert_eq!(restored.enabled_mods, settings.enabled_mods);
+        assert_eq!(restored.extra, settings.extra);
         Ok(())
     }
 }

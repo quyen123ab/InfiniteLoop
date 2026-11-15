@@ -1,4 +1,5 @@
 {
-  "repositoryUrl": "https://github.com/reiserFSs/InfiniteLoop.git",
-  "branch": "master"
+  "repositoryUrl": "https://github.com/quyen123ab/InfiniteLoop.git",
+  "branch": "integration/pgr49-gmtools",
+  "bundledLocalServer": true
 }

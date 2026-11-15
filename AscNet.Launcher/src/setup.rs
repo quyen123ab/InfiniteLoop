@@ -1082,16 +1082,21 @@ fn network_matches(config: &Value, game_port: u16, mongo_port: u16) -> bool {
 /// owned by Setup and must still match the build.
 pub(crate) fn install_runtime_config(root: &Path, server_directory: &Path, game_port: u16, mongo_port: u16) -> Result<()> {
     let source = root.join("config.json");
-    let bytes = fs::read(&source).with_context(|| format!("read {}", source.display()))?;
-    let config: Value = serde_json::from_slice(&bytes).with_context(|| format!("{} is not valid JSON", source.display()))?;
-    if !network_matches(&config, game_port, mongo_port) {
-        bail!("{} has changed GameServer/Database settings; restore them or run Setup again", source.display());
-    }
+    let bytes = read_runtime_config(&source, game_port, mongo_port)?;
     let target = server_directory.join("Configs").join("config.json");
     if fs::read(&target).ok().as_deref() != Some(bytes.as_slice()) {
         write_atomic(&target, &bytes)?;
     }
     Ok(())
+}
+
+pub(crate) fn read_runtime_config(source: &Path, game_port: u16, mongo_port: u16) -> Result<Vec<u8>> {
+    let bytes = fs::read(source).with_context(|| format!("read {}", source.display()))?;
+    let config: Value = serde_json::from_slice(&bytes).with_context(|| format!("{} is not valid JSON", source.display()))?;
+    if !network_matches(&config, game_port, mongo_port) {
+        bail!("{} has changed GameServer/Database settings; restore them or run Setup again", source.display());
+    }
+    Ok(bytes)
 }
 
 fn json_string(value: &Value, path: &[&str]) -> Option<String> {
@@ -1179,7 +1184,7 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1346,7 +1351,7 @@ fn run_windows(
     fs::create_dir_all(root.join("logs"))?;
     let (sdk_port, game_port, mongo_port) = choose_ports(root, previous.as_ref())?;
     let config_path = root.join("config.json");
-    prepare_config(&checkout, &config_path, game_port, mongo_port)?;
+    prepare_config(&checkout.join("Resources/Configs/config.json"), &config_path, game_port, mongo_port)?;
     let build_root = root.join("build");
     fs::create_dir_all(&build_root)?;
     let final_dir = build_root.join(&revision);
@@ -2256,12 +2261,12 @@ fn choose_ports(root: &Path, previous: Option<&Value>) -> Result<(u16, u16, u16)
 }
 
 #[cfg(windows)]
-fn prepare_config(checkout: &Path, config_path: &Path, game_port: u16, mongo_port: u16) -> Result<()> {
+fn prepare_config(defaults: &Path, config_path: &Path, game_port: u16, mongo_port: u16) -> Result<()> {
     if !config_path.is_file() {
-        let source = fs::read(checkout.join("Resources").join("Configs").join("config.json")).context("read checkout config.json")?;
-        let mut config: Value = serde_json::from_slice(&source).context("checkout config.json is invalid")?;
+        let source = fs::read(defaults).with_context(|| format!("read {}", defaults.display()))?;
+        let mut config: Value = serde_json::from_slice(&source).context("default config.json is invalid")?;
         if !config.is_object() {
-            bail!("checkout config.json is invalid");
+            bail!("default config.json is invalid");
         }
         apply_network(&mut config, game_port, mongo_port);
         let mut bytes = serde_json::to_vec_pretty(&config)?;
@@ -2273,6 +2278,53 @@ fn prepare_config(checkout: &Path, config_path: &Path, game_port: u16, mongo_por
         bail!("Persistent config.json network fields do not match the reserved local ports. Restore GameServer/Database loopback settings; setup will not overwrite user configuration.");
     }
     Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn prepare_paired_runtime(
+    root: &Path,
+    defaults: &Path,
+    state_path: &Path,
+    progress: &mut dyn FnMut(&str),
+    log: &mut dyn FnMut(&str) -> Result<()>,
+    deadline: Instant,
+) -> Result<crate::local::PairedRuntime> {
+    let job = crate::local::create_job()?;
+    SETUP_JOB.with(|slot| *slot.borrow_mut() = Some(job));
+    let _guard = JobGuard;
+    let previous = match read_previous_state(state_path)? {
+        Some(state) => Some(state),
+        None => read_previous_state(&root.join("build-state.json"))?,
+    };
+    let (sdk_port, game_port, mongo_port) = choose_ports(root, previous.as_ref())?;
+    let tools = root.join("tools");
+    fs::create_dir_all(root.join("tmp"))?;
+    fs::create_dir_all(&tools)?;
+    prepare_config(defaults, &root.join("config.json"), game_port, mongo_port)?;
+    let mut dotnet = None;
+    for candidate in dotnet_candidates(root) {
+        if !candidate.is_file() { continue; }
+        let mut command = Command::new(&candidate);
+        command.arg("--list-runtimes");
+        let Ok(output) = capture_command(&mut command, "dotnet --list-runtimes", deadline, false, progress, log) else {
+            continue;
+        };
+        let runtimes = String::from_utf8_lossy(&output.stdout);
+        if runtimes.lines().any(|line| line.starts_with("Microsoft.AspNetCore.App 8."))
+            && runtimes.lines().any(|line| line.starts_with("Microsoft.NETCore.App 8."))
+        {
+            dotnet = Some(std::path::absolute(candidate)?);
+            break;
+        }
+    }
+    let dotnet = match dotnet {
+        Some(path) => path,
+        None => ensure_dotnet(root, deadline, progress, log)?,
+    };
+    let mongod = ensure_mongo(root, &tools, previous.as_ref(), deadline, progress, log)?;
+    Ok(crate::local::PairedRuntime {
+        dotnet, mongod: std::path::absolute(mongod)?, sdk_port, game_port, mongo_port,
+    })
 }
 
 /// MSBuild's out-of-proc nodes deadlock on Wine pipes. These switches keep

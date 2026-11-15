@@ -87,7 +87,7 @@ Guild contribution (38), Command Bureau EXP (40), Beacon Amplifier Points (46), 
 | 97086 | Retro Module | Retro Module | 999,999 | Retro Prize Counter 1468 |
 | 50135 | Insatiable Chips | Insatiable Chips | 999,999 | Permanent shop 1436 |
 
-62738 pays Simulated Battlefield shops 1421 Version Limited, 1422 Material Shop, and 1423 Memory Shop. It is not 105.
+Item 62738 pays Simulated Battlefield shops 1421 Version Limited, 1422 Material Shop, and 1423 Memory Shop. Material Shop 1422 also accepts it for four-item bundles of Overclock alloys, weapon cores, and Memory circuits. [Simulator exchange prices](pgr49-equipment-one-click.md#simulator-exchange-offers)
 
 Shrouded Requiem Discernment (97085) can sit in the bag. Talent level moves only when a settlement grants it. Mammon Platinum Coin (97054) is granted into the bag and no implemented shop spends it. Godfall's in-run gold is the run's `GoldNum`.
 
@@ -126,7 +126,9 @@ Shrouded Requiem Discernment (97085) can sit in the bag. Talent level moves only
 | 28 | 5★ Memory Shard | 99,999 | Memory exchange, and a 5★ memory resonance option |
 | 29 | 6★ Memory Shard | 99,999 | Memory exchange, and a 6★ memory resonance option (150 per roll) |
 | 96004 | 6★ Weapon Resonance Shard | 9,999 | Weapon Resonance Exchange Shop |
-| 30113 | Integrated CUB EXP (L) | 9,999 | CUB level-up. 30111 is the small pod. |
+| 30111 | Integrated CUB EXP (S) | 9,999 | 100 CUB EXP per pod for 1,000 coins. |
+| 30112 | CUB EXP CUB (scrapped) | 9,999 | The 4.9 quick-upgrade planner selects this configured item for 300 CUB EXP and 3,000 coins. |
+| 30113 | Integrated CUB EXP (L) | 9,999 | 500 CUB EXP per pod for 5,000 coins. |
 | 40200 | Support Overclock Bundle (S) | 9,999 | Low-rank CUB level-cap break |
 | 40201 | Support Overclock Bundle (L) | 9,999 | High-rank CUB level-cap break |
 | 40301 | Support Skill Component | 9,999 | CUB skill levels |

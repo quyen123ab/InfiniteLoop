@@ -63,7 +63,22 @@ fn scan(root: &Path) -> Result<Vec<ModInfo>> {
 }
 /// Mods the user can toggle; core mods are always installed and never offered.
 pub fn discover(root: &Path) -> Result<Vec<ModInfo>> {
-    Ok(scan(root)?.into_iter().filter(|m| !m.core).collect())
+    discover_from(&[root.to_path_buf()])
+}
+
+fn scan_roots(roots: &[PathBuf]) -> Result<BTreeMap<String, (ModInfo, PathBuf)>> {
+    let mut catalog = BTreeMap::new();
+    for root in roots {
+        for info in scan(root)? {
+            let directory = target(root, &info.id)?;
+            catalog.entry(info.id.clone()).or_insert((info, directory));
+        }
+    }
+    Ok(catalog)
+}
+
+pub fn discover_from(roots: &[PathBuf]) -> Result<Vec<ModInfo>> {
+    Ok(scan_roots(roots)?.into_values().map(|(info, _)| info).filter(|info| !info.core).collect())
 }
 fn lua_string(value: &str) -> String {
     let mut out = String::from("\"");
@@ -262,7 +277,7 @@ fn write_config(path: &Path, bytes: &[u8]) -> Result<()> {
 pub fn set_debug(config_path: &Path, enabled: bool) -> Result<()> {
     stopped()?;
     no_links(config_path)?;
-    if !config_path.try_exists()? { return Ok(()); }
+    if !config_path.try_exists()? || read_debug(config_path)? == enabled { return Ok(()); }
     let bytes = debug_bytes(config_path, enabled)?;
     write_config(config_path, &bytes).context("save persistent Client.Debug")
 }
@@ -302,38 +317,50 @@ pub fn clean(_game_dir: &Path, persistent_dir: &Path) -> Result<()> {
     stopped()?;
     replace(persistent_dir, &BTreeMap::new())
 }
-pub fn apply(game_dir: &Path, persistent_dir: &Path, mods_root: &Path, config_path: &Path, selected: &[String]) -> Result<ApplyReport> {
-    stopped()?;
-    apply_stopped(game_dir, persistent_dir, mods_root, config_path, selected)
+
+pub fn has_installed_overrides(root: &Path) -> Result<bool> {
+    target(root, MANIFEST)?.try_exists().context("inspect installed client mod manifest")
 }
+pub fn apply(game_dir: &Path, persistent_dir: &Path, mods_root: &Path, config_path: &Path, selected: &[String]) -> Result<ApplyReport> {
+    apply_from(game_dir, persistent_dir, &[mods_root.to_path_buf()], config_path, selected, None)
+}
+pub fn apply_from(game_dir: &Path, persistent_dir: &Path, roots: &[PathBuf], config_path: &Path, selected: &[String], required: Option<&str>) -> Result<ApplyReport> {
+    stopped()?;
+    apply_catalog(game_dir, persistent_dir, scan_roots(roots)?, config_path, selected, required)
+}
+#[cfg(test)]
 fn apply_stopped(game_dir: &Path, persistent_dir: &Path, mods_root: &Path, config_path: &Path, selected: &[String]) -> Result<ApplyReport> {
+    apply_catalog(game_dir, persistent_dir, scan_roots(&[mods_root.to_path_buf()])?, config_path, selected, None)
+}
+fn apply_catalog(
+    game_dir: &Path, persistent_dir: &Path, catalog: BTreeMap<String, (ModInfo, PathBuf)>,
+    config_path: &Path, selected: &[String], required: Option<&str>,
+) -> Result<ApplyReport> {
     let mut outputs = BTreeMap::new();
     let mut destinations = BTreeSet::new();
     let mut report = ApplyReport::default();
     let mut payload = None;
-    let all = scan(mods_root)?;
     // Core mods are mandatory: other mods depend on them, so a failed core aborts instead of skipping.
     let mut seen = BTreeSet::new();
-    let ids: Vec<&String> = all.iter().filter(|m| m.core).map(|m| &m.id)
-        .chain(selected.iter().filter(|id| !all.iter().any(|m| &m.id == *id && m.core)))
+    let ids: Vec<&String> = catalog.values().filter(|(info, _)| info.core).map(|(info, _)| &info.id)
+        .chain(selected.iter())
         .filter(|id| seen.insert(*id)).collect();
     let mut installed_mods: Vec<(ModInfo, BTreeMap<String, Vec<u8>>)> = Vec::new();
     for id in ids {
         let result = (|| -> Result<BTreeMap<String, Vec<u8>>> {
-            ensure!(all.iter().any(|m| &m.id == id), "mod not found in catalog");
-            let root = target(mods_root, id)?;
-            let mut files = Vec::new(); collect(&root, &root, &mut files)?; files.sort();
+            let (_, root) = catalog.get(id).context("mod not found in catalog")?;
+            let mut files = Vec::new(); collect(root, root, &mut files)?; files.sort();
             let mut staged = BTreeMap::new();
             for rel in files {
                 let (out, data) = if rel.starts_with("Table/") && rel.ends_with(".tab") {
-                    let bytes = fs::read(target(&root,&rel)?)?; check_table(&bytes)?; (rel.clone(), bytes)
+                    let bytes = fs::read(target(root,&rel)?)?; check_table(&bytes)?; (rel.clone(), bytes)
                 } else if rel.ends_with(".lua") && !rel.starts_with("Table/") {
-                    (format!("Lua/Matrix/{rel}"), fs::read(target(&root,&rel)?)?)
+                    (format!("Lua/Matrix/{rel}"), fs::read(target(root,&rel)?)?)
                 } else if let Some(module) = rel.strip_suffix(".diff") {
                     if payload.is_none() { payload = Some(crate::bundle::load_matrix_payload(game_dir)?); }
                     let name = format!("{}.lua", module.rsplit('/').next().context("missing module name")?);
                     let original = crate::bundle::extract_text_asset(payload.as_deref().context("missing bundle payload")?, &name)?;
-                    (format!("Lua/Matrix/{module}.lua"), apply_diff(original, &fs::read(target(&root,&rel)?)?)?)
+                    (format!("Lua/Matrix/{module}.lua"), apply_diff(original, &fs::read(target(root,&rel)?)?)?)
                 } else { continue; };
                 target(persistent_dir,&out)?;
                 let folded = out.to_ascii_lowercase();
@@ -344,10 +371,12 @@ fn apply_stopped(game_dir: &Path, persistent_dir: &Path, mods_root: &Path, confi
             ensure!(!staged.is_empty(), "mod has no supported files");
             Ok(staged)
         })();
-        let info = all.iter().find(|m| &m.id == id);
+        let info = catalog.get(id).map(|(info, _)| info);
         match result {
             Ok(staged) => { destinations.extend(staged.keys().map(|s| s.to_ascii_lowercase())); outputs.extend(staged.clone()); report.applied.push(id.clone()); installed_mods.extend(info.map(|i| (i.clone(), staged))); }
-            Err(error) if info.is_some_and(|m| m.core) => bail!("core mod {id} failed, nothing installed: {error:#}"),
+            Err(error) if info.is_some_and(|m| m.core) || required == Some(id.as_str()) => {
+                bail!("Required client mod {id} could not be applied: {error:#}")
+            }
             Err(error) => report.skipped.push(format!("{id}: {error:#}")),
         }
     }
@@ -357,7 +386,11 @@ fn apply_stopped(game_dir: &Path, persistent_dir: &Path, mods_root: &Path, confi
         target(persistent_dir, &out)?;
         outputs.insert(out, catalog_lua(&refs).into_bytes());
     }
-    let debug = if outputs.is_empty() || !config_path.try_exists()? { None } else { Some(debug_bytes(config_path,true)?) };
+    let debug = if outputs.is_empty() || !config_path.try_exists()? || read_debug(config_path)? {
+        None
+    } else {
+        Some(debug_bytes(config_path, true)?)
+    };
     let previous_config = if debug.is_some() { Some(fs::read(config_path)?) } else { None };
     if let Some(bytes) = debug { write_config(config_path,&bytes).context("save persistent Client.Debug")?; }
     if let Err(error) = replace(persistent_dir,&outputs) {

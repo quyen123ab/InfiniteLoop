@@ -604,23 +604,19 @@ namespace AscNet.Common.Database
                     && equipRowsById.TryGetValue(characterRow.EquipId, out EquipTable? defaultEquipRow)
                     && IsOwnableEquipTemplate(defaultEquipRow))
                 {
-                    List<EquipData> assignedEquips = Equips
-                        .Where(equip => equip.CharacterId == characterRow.Id)
+                    List<EquipData> assignedWeapons = Equips
+                        .Where(equip => equip.CharacterId == characterRow.Id
+                            && equipRowsById.TryGetValue((int)equip.TemplateId, out EquipTable? row) && row.Site == 0)
                         .ToList();
-                    bool hasCompatibleAssignedEquip = assignedEquips.Any(equip =>
-                        equipRowsById.TryGetValue((int)equip.TemplateId, out EquipTable? assignedEquipRow)
-                        && assignedEquipRow.Type == characterRow.EquipType);
+                    bool hasCompatibleAssignedWeapon = assignedWeapons.Any(equip =>
+                        equipRowsById[(int)equip.TemplateId].Type == characterRow.EquipType);
 
-                    if (!hasCompatibleAssignedEquip)
+                    if (!hasCompatibleAssignedWeapon)
                     {
-                        foreach (EquipData assignedEquip in assignedEquips)
+                        foreach (EquipData weapon in assignedWeapons)
                         {
-                            if (!equipRowsById.TryGetValue((int)assignedEquip.TemplateId, out EquipTable? assignedEquipRow)
-                                || assignedEquipRow.Type != characterRow.EquipType)
-                            {
-                                assignedEquip.CharacterId = 0;
-                                changed = true;
-                            }
+                            weapon.CharacterId = 0;
+                            changed = true;
                         }
 
                         EquipData? existingDefaultEquip = Equips.FirstOrDefault(equip => equip.TemplateId == (uint)characterRow.EquipId && equip.CharacterId == 0);
@@ -1522,9 +1518,10 @@ namespace AscNet.Common.Database
             collection.ReplaceOne(Builders<Character>.Filter.Eq(x => x.Id, Id), this);
         }
 
-        public void SaveChecked()
+        public void SaveChecked(bool journal = false)
         {
-            ReplaceOneResult result = collection.ReplaceOne(
+            IMongoCollection<Character> destination = journal ? collection.WithWriteConcern(WriteConcern.W1.With(journal: true)) : collection;
+            ReplaceOneResult result = destination.ReplaceOne(
                 Builders<Character>.Filter.Eq(x => x.Id, Id),
                 this);
             if (!result.IsAcknowledged || result.MatchedCount != 1)

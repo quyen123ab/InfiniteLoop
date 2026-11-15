@@ -1,0 +1,52 @@
+name: PGR 4.9 distribution validation
+
+on:
+  push:
+    branches:
+      - integration/pgr49-gmtools
+      - 'update/pgr49-*'
+  pull_request:
+    branches: [integration/pgr49-gmtools]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.428
+      - name: Install pinned MongoDB
+        shell: pwsh
+        run: |
+          $url = 'https://fastdl.mongodb.org/windows/mongodb-windows-x86_64-8.0.38.zip'
+          $zip = Join-Path $env:RUNNER_TEMP 'mongod.zip'
+          Invoke-WebRequest $url -OutFile $zip
+          $expected = ((Invoke-WebRequest "$url.sha256").Content -split '\s+')[0]
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ine $expected) { throw 'MongoDB archive SHA-256 mismatch' }
+          Expand-Archive $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'mongo')
+          $mongo = Get-ChildItem (Join-Path $env:RUNNER_TEMP 'mongo') -Filter mongod.exe -Recurse | Select-Object -First 1
+          if (!$mongo) { throw 'MongoDB executable missing' }
+          "PGR_MONGOD=$($mongo.FullName)" >> $env:GITHUB_ENV
+      - name: Run focused and differential regression suites
+        shell: pwsh
+        run: ./Scripts/Pgr49/Test-Pgr49.ps1 -MongoExe $env:PGR_MONGOD -OutputDirectory "$env:RUNNER_TEMP/pgr49-tests"
+      - name: Test the native launcher
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.0-x86_64-pc-windows-msvc --profile minimal
+          cargo +1.97.0-x86_64-pc-windows-msvc test --manifest-path AscNet.Launcher/Cargo.toml --locked --target x86_64-pc-windows-msvc -j 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pgr49-validation
+          path: |
+            ${{ runner.temp }}/pgr49-tests/regression-*/*.log
+            ${{ runner.temp }}/pgr49-tests/regression-*/verification.json
